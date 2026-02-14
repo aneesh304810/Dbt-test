@@ -1,0 +1,199 @@
+name: SEI to Advent - Test Automation
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+env:
+  DUCKDB_PATH: ${{ github.workspace }}/dbt_sei_to_advent.duckdb
+  DBT_PROFILES_DIR: ${{ github.workspace }}
+
+jobs:
+  test:
+    name: Run Comprehensive Test Suite
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install dbt-core dbt-duckdb duckdb pandas great-expectations
+          pip install -r requirements.txt || true
+      
+      - name: Install dbt packages
+        run: |
+          dbt deps --project-dir .
+      
+      - name: Run dbt seed
+        run: |
+          dbt seed --project-dir .
+      
+      - name: Load sample data (if available)
+        run: |
+          python scripts/load_sample_data.py || true
+        continue-on-error: true
+      
+      - name: Run dbt models
+        run: |
+          dbt run --project-dir .
+      
+      - name: Run comprehensive test suite
+        id: tests
+        run: |
+          python python_tests/comprehensive_test_suite.py
+        continue-on-error: true
+      
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-reports-${{ matrix.python-version }}
+          path: |
+            reports/*.html
+            reports/*.json
+          retention-days: 30
+      
+      - name: Upload dbt artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: dbt-artifacts-${{ matrix.python-version }}
+          path: |
+            target/manifest.json
+            target/run_results.json
+            target/catalog.json
+          retention-days: 30
+      
+      - name: Comment PR with test results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'reports/test_report_latest.json';
+            
+            if (fs.existsSync(reportPath)) {
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              const status = report.overall_status === 'PASSED' ? '✅ PASSED' : '❌ FAILED';
+              const summary = report.summary.total;
+              
+              const comment = `## 🔍 Test Results ${status}
+              
+              **Summary:**
+              - **Total Tests:** ${summary.passed + summary.failed + summary.warned}
+              - **Passed:** ${summary.passed} ✅
+              - **Failed:** ${summary.failed} ❌
+              - **Warned:** ${summary.warned} ⚠️
+              
+              **By Phase:**
+              - dbt Tests: ${report.summary.dbt.passed}/${report.summary.dbt.passed + report.summary.dbt.failed} passed
+              - DuckDB Validations: ${report.summary.duckdb.passed}/${report.summary.duckdb.passed + report.summary.duckdb.failed} passed
+              - Great Expectations: ${report.summary.great_expectations.passed}/${report.summary.great_expectations.passed + report.summary.great_expectations.failed} passed
+              
+              [View Full Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              `;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+      
+      - name: Fail job if tests failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1
+
+  quality-gates:
+    name: Data Quality Gates
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+      - name: Download test reports
+        uses: actions/download-artifact@v3
+        with:
+          name: test-reports-3.11
+      
+      - name: Check quality thresholds
+        run: |
+          python << 'EOF'
+          import json
+          import sys
+          
+          with open('reports/test_report_latest.json') as f:
+              report = json.load(f)
+          
+          total = report['summary']['total']
+          pass_rate = total['passed'] / (total['passed'] + total['failed']) * 100
+          
+          print(f"Pass Rate: {pass_rate:.2f}%")
+          
+          # Quality gates
+          MIN_PASS_RATE = 95.0
+          MAX_FALLBACK_RATE = 20.0
+          
+          if pass_rate < MIN_PASS_RATE:
+              print(f"❌ FAIL: Pass rate {pass_rate:.2f}% is below threshold {MIN_PASS_RATE}%")
+              sys.exit(1)
+          
+          print(f"✅ PASS: All quality gates passed")
+          EOF
+
+  deploy-docs:
+    name: Deploy dbt Docs
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dbt
+        run: |
+          pip install dbt-core dbt-duckdb
+      
+      - name: Generate dbt docs
+        run: |
+          dbt deps
+          dbt docs generate
+      
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target
+          destination_dir: dbt-docs

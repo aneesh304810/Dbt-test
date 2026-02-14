@@ -1,0 +1,385 @@
+version: 2
+
+models:
+  - name: advent_securities
+    description: |
+      Final Advent Advantage compatible output with L1 + L2 mappings.
+      
+      **Test Coverage:**
+      - Primary key constraints
+      - Referential integrity to seeds
+      - Data quality checks (format, patterns, ranges)
+      - Business rule validations
+      - Cross-table consistency
+      - Completeness and coverage metrics
+    
+    meta:
+      owner: "data_engineering"
+      priority: "critical"
+    
+    tests:
+      # Row-level reconciliation tests
+      - dbt_utils.equal_rowcount:
+          compare_model: ref('stg_sei_securities')
+      
+      # Expression tests - check for any null primary identifiers
+      - dbt_utils.expression_is_true:
+          expression: "SECURITY_ID is not null"
+          name: security_id_never_null
+      
+      # Check no duplicates exist
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - SECURITY_ID
+          name: unique_security_id_combination
+    
+    columns:
+      # ==============================================================
+      # PRIMARY IDENTIFIERS
+      # ==============================================================
+      
+      - name: SECURITY_ID
+        description: "Unique security identifier from SEI system"
+        tests:
+          - unique
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_of_type:
+              column_type: varchar
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 1
+              max_value: 50
+          - relationships:
+              to: ref('stg_sei_securities')
+              field: security_id
+              name: security_id_exists_in_staging
+      
+      - name: CUSIP
+        description: "9-character CUSIP identifier"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 9
+              config:
+                where: "CUSIP is not null"
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^[A-Z0-9]{9}$"
+              config:
+                where: "CUSIP is not null"
+      
+      - name: ISIN
+        description: "12-character ISIN identifier"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 12
+              config:
+                where: "ISIN is not null"
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^[A-Z]{2}[A-Z0-9]{10}$"
+              config:
+                where: "ISIN is not null"
+      
+      - name: SEDOL
+        description: "7-character SEDOL identifier"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 7
+              config:
+                where: "SEDOL is not null"
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^[A-Z0-9]{7}$"
+              config:
+                where: "SEDOL is not null"
+      
+      - name: TICKER_SYMBOL
+        description: "Stock ticker symbol"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 1
+              max_value: 20
+              config:
+                where: "TICKER_SYMBOL is not null"
+      
+      # ==============================================================
+      # DESCRIPTIVE FIELDS
+      # ==============================================================
+      
+      - name: SECURITY_NAME
+        description: "Human-readable security name"
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 1
+              max_value: 100
+      
+      - name: SECURITY_DESCRIPTION
+        description: "Extended security description"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 0
+              max_value: 255
+              config:
+                where: "SECURITY_DESCRIPTION is not null"
+      
+      - name: ISSUER_NAME
+        description: "Name of the issuing entity"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 0
+              max_value: 100
+              config:
+                where: "ISSUER_NAME is not null"
+      
+      # ==============================================================
+      # LEVEL 1: ASSET CLASSIFICATION (CRITICAL)
+      # ==============================================================
+      
+      - name: ASSET_CLASS_CODE
+        description: "Advent asset class code (Level 1)"
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - 'EQD'
+                - 'EQI'
+                - 'EQEM'
+                - 'EQSM'
+                - 'EQLG'
+                - 'FIG'
+                - 'FIC'
+                - 'FIM'
+                - 'FIHY'
+                - 'FIIG'
+                - 'FIMB'
+                - 'FIAB'
+                - 'FITIP'
+                - 'FIIN'
+                - 'FIEM'
+                - 'AHFN'
+                - 'APRE'
+                - 'ARET'
+                - 'ACOM'
+                - 'AINF'
+                - 'CASH'
+                - 'CONV'
+                - 'PREF'
+                - 'MLTB'
+                - 'OTHR'
+          - relationships:
+              to: ref('seed_asset_class_crosswalk')
+              field: advent_asset_class_code
+              name: asset_class_code_exists_in_seed
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^[A-Z]{2,6}$"
+              name: asset_class_code_format_valid
+      
+      - name: ASSET_CLASS
+        description: "Full Advent asset class description"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('seed_asset_class_crosswalk')
+              field: advent_asset_class
+              name: asset_class_exists_in_seed
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 1
+              max_value: 100
+      
+      # ==============================================================
+      # LEVEL 2: STRATEGY (CRITICAL)
+      # ==============================================================
+      
+      - name: STRATEGY_CODE
+        description: "Advent strategy code (Level 2)"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('seed_strategy_crosswalk')
+              field: advent_strategy_code
+              name: strategy_code_exists_in_seed
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^[A-Z]{2,10}_[A-Z]{2,5}$"
+              name: strategy_code_format_valid
+              config:
+                where: "STRATEGY_CODE != 'OTHR_DEF'"
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 1
+              max_value: 20
+      
+      - name: STRATEGY_DESCRIPTION
+        description: "Full Advent strategy description"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('seed_strategy_crosswalk')
+              field: advent_strategy_desc
+              name: strategy_desc_exists_in_seed
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 1
+              max_value: 255
+      
+      # ==============================================================
+      # SECURITY TYPE
+      # ==============================================================
+      
+      - name: SECURITY_TYPE
+        description: "High-level security type classification"
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - 'EQUITY'
+                - 'FIXED_INCOME'
+                - 'OPTION'
+                - 'FUTURE'
+                - 'CASH_EQUIV'
+                - 'CONVERTIBLE'
+                - 'PREFERRED'
+                - 'ALTERNATIVE'
+                - 'OTHER'
+      
+      # ==============================================================
+      # GEOGRAPHY AND CURRENCY
+      # ==============================================================
+      
+      - name: BASE_CURRENCY
+        description: "ISO 4217 3-character currency code"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 3
+              config:
+                where: "BASE_CURRENCY is not null"
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^[A-Z]{3}$"
+              config:
+                where: "BASE_CURRENCY is not null"
+          - dbt_expectations.expect_column_values_to_be_in_set:
+              value_set: ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'CNY', 'HKD', 'SGD', 'INR', 'BRL', 'MXN', 'KRW', 'ZAR', 'SEK', 'NOK', 'DKK', 'NZD', 'PLN']
+              config:
+                where: "BASE_CURRENCY is not null"
+                severity: warn
+      
+      - name: COUNTRY_CODE
+        description: "ISO 3166-1 alpha-2 country code"
+        tests:
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 2
+              config:
+                where: "COUNTRY_CODE is not null"
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^[A-Z]{2}$"
+              config:
+                where: "COUNTRY_CODE is not null"
+      
+      # ==============================================================
+      # FIXED INCOME SPECIFICS
+      # ==============================================================
+      
+      - name: MATURITY_DATE
+        description: "Maturity date for fixed income securities"
+        tests:
+          - dbt_expectations.expect_column_values_to_be_of_type:
+              column_type: date
+              config:
+                where: "MATURITY_DATE is not null"
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: "'1900-01-01'"
+              max_value: "'2100-12-31'"
+              config:
+                where: "MATURITY_DATE is not null"
+      
+      - name: COUPON_RATE
+        description: "Annual coupon rate (decimal format)"
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 0.30
+              config:
+                where: "COUPON_RATE is not null"
+                severity: warn
+      
+      # ==============================================================
+      # PRICING DATA
+      # ==============================================================
+      
+      - name: PRICE
+        description: "Latest security price"
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 1000000
+              config:
+                where: "PRICE is not null"
+                severity: warn
+      
+      - name: PRICE_DATE
+        description: "Date of latest price"
+        tests:
+          - dbt_expectations.expect_column_values_to_be_of_type:
+              column_type: date
+              config:
+                where: "PRICE_DATE is not null"
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: "'2020-01-01'"
+              max_value: "CURRENT_DATE"
+              config:
+                where: "PRICE_DATE is not null"
+                severity: warn
+      
+      - name: MARKET_CAP
+        description: "Market capitalization"
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 10000000000000
+              config:
+                where: "MARKET_CAP is not null"
+                severity: warn
+      
+      # ==============================================================
+      # STATUS
+      # ==============================================================
+      
+      - name: STATUS
+        description: "Security status: A=Active, I=Inactive, U=Unknown"
+        tests:
+          - accepted_values:
+              values: ['A', 'I', 'U']
+          - dbt_expectations.expect_column_values_to_be_in_set:
+              value_set: ['A', 'I', 'U']
+      
+      # ==============================================================
+      # AUDIT COLUMNS (Technical Metadata)
+      # ==============================================================
+      
+      - name: _L1_MAPPING_METHOD
+        description: "Method used for Level 1 mapping"
+        tests:
+          - accepted_values:
+              values: ['DIRECT', 'PARENT_ROLLUP', 'FALLBACK']
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 6
+              max_value: 20
+      
+      - name: _L2_MAPPING_METHOD
+        description: "Method used for Level 2 mapping"
+        tests:
+          - accepted_values:
+              values: ['DIRECT', 'ASSET_CLASS_DEFAULT', 'FALLBACK']
+          - dbt_expectations.expect_column_value_lengths_to_be_between:
+              min_value: 6
+              max_value: 25
+      
+      - name: _SEI_ASSET_CLASS_CODE
+        description: "Original SEI asset class code for audit trail"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('map_sei_to_advent_asset_class')
+              field: sei_asset_class_code
+              name: sei_asset_class_traceable_to_mapping
+      
+      - name: _TRANSFORMATION_TS
+        description: "Timestamp when record was transformed"
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_of_type:
+              column_type: timestamp
