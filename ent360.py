@@ -1,978 +1,573 @@
 """
-========================================================
-Enterprise Data Explorer 360° - Complete GPU Edition
-========================================================
-Optimized for 8x Nvidia Blackwell GPUs
-Features:
-✓ Multi-GPU semantic matching (All-MiniLM-L6-v2)
-✓ Phi-3 AI business insights
-✓ Interactive data lineage graphs
-✓ Color-coded inbound/outbound flows
-✓ Interface + SQL + Lineage mapping
-✓ Advanced filtering and search
-========================================================
+================================================================
+Enterprise Data Explorer 360 - Bank-Grade Edition
+================================================================
+Spec-aligned:
+  - Interface.xlsx = authoritative (5 sheets)
+  - 4-step matching: Deterministic -> Feed Validation -> Semantic -> Aggregation
+  - all-MiniLM-L6-v2 for similarity scoring ONLY
+  - Phi-3 for explanation ONLY (never decisions)
+  - Lineage graph with filtering
+  - Full audit logging
+
+Usage:
+  streamlit run data_explorer_360.py
+
+Requirements:
+  pip install streamlit pandas openpyxl numpy plotly networkx
+  pip install torch sentence-transformers transformers
+  Optional: pip install bitsandbytes accelerate
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import json
-import re
-import os
-from collections import defaultdict
-from typing import List, Dict, Tuple, Optional, Any
-import logging
+import re, os, json
 from datetime import datetime
-import time
-import warnings
-warnings.filterwarnings('ignore')
+from collections import defaultdict
 
-# GPU and ML
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from sentence_transformers import SentenceTransformer, util
-
-# Visualization
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import networkx as nx
-
-# SQL Parsing
 try:
-    import sqlglot
-    from sqlglot.expressions import Table, Column, Join
-    SQLGLOT_AVAILABLE = True
-except:
-    SQLGLOT_AVAILABLE = False
+    import plotly.graph_objects as go
+    import networkx as nx
+    GRAPH_OK = True
+except ImportError:
+    GRAPH_OK = False
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+try:
+    import torch
+    from sentence_transformers import SentenceTransformer, util
+    ML_OK = True
+except ImportError:
+    ML_OK = False
 
-# ========================================================
-# GPU CONFIGURATION
-# ========================================================
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline as hf_pipeline
+    LLM_OK = True
+except ImportError:
+    LLM_OK = False
 
-class GPUManager:
-    """Manage single GPU with 8GB VRAM - Optimized for memory efficiency"""
-    
-    def __init__(self):
-        self.device_count = torch.cuda.device_count()
-        self.primary_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            memory_gb = props.total_memory / (1024**3)
-            logger.info(f"🚀 GPU Detected: {props.name} ({memory_gb:.1f}GB VRAM)")
-            
-            # Enable memory optimizations for 8GB GPU
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.cuda.empty_cache()  # Clear cache
-            
-            # Set memory fraction to prevent OOM
-            if memory_gb <= 8.5:
-                logger.info("⚙️ Enabling memory optimizations for 8GB GPU")
-        else:
-            logger.warning("⚠️ No GPU detected, using CPU")
-    
-    def get_device(self, gpu_id: int = 0):
-        """Always return cuda:0 for single GPU"""
-        if torch.cuda.is_available():
-            return "cuda:0"
-        return "cpu"
-    
-    def get_memory_stats(self, gpu_id: int = 0):
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(0) / (1024**3)
-            reserved = torch.cuda.memory_reserved(0) / (1024**3)
-            total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            return f"Using: {allocated:.2f}GB / {total:.1f}GB (Reserved: {reserved:.2f}GB)"
-        return "N/A"
-    
-    def clear_memory(self):
-        """Clear GPU cache to free memory"""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            import gc
-            gc.collect()
-            logger.info("🧹 GPU memory cleared")
+st.set_page_config(page_title="Data Explorer 360", page_icon="", layout="wide", initial_sidebar_state="expanded")
 
-gpu_manager = GPUManager()
+DEVICE = "cpu"
+if ML_OK and torch.cuda.is_available():
+    DEVICE = "cuda"
+elif ML_OK:
+    torch.set_num_threads(8)
 
-# ========================================================
-# STREAMLIT CONFIGURATION
-# ========================================================
+EMB_PATH = os.environ.get("EMBEDDING_MODEL_PATH", "C:/SEI/AneeshModel/all-minilm-l6-v2")
+PHI3_PATH = os.environ.get("PHI3_MODEL_PATH", "C:/SEI/AneeshModel/Phi-3-mini-4k-instruct")
+MAP_FILE = "interface_sql_mapping.xlsx"
 
-st.set_page_config(
-    page_title="Enterprise Data Explorer 360°",
-    page_icon="🌐",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# ========================================================
-# PREMIUM STYLING
-# ========================================================
-
+#  STYLING 
 st.markdown("""
 <style>
-    .premium-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
-        padding: 2.5rem;
-        border-radius: 20px;
-        text-align: center;
-        margin-bottom: 2rem;
-        box-shadow: 0 15px 40px rgba(102, 126, 234, 0.4);
-    }
-    
-    .premium-title {
-        font-size: 3.5rem;
-        font-weight: 900;
-        color: white;
-        margin: 0;
-        text-shadow: 3px 3px 6px rgba(0,0,0,0.3);
-    }
-    
-    .premium-subtitle {
-        font-size: 1.3rem;
-        color: rgba(255,255,255,0.95);
-        margin-top: 0.5rem;
-    }
-    
-    .gpu-badge {
-        display: inline-block;
-        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
-        color: white;
-        padding: 0.6rem 1.5rem;
-        border-radius: 25px;
-        font-weight: 700;
-        font-size: 0.95rem;
-        box-shadow: 0 4px 15px rgba(17, 153, 142, 0.3);
-        margin: 0.5rem;
-    }
-    
-    .metric-card {
-        background: white;
-        padding: 2rem;
-        border-radius: 15px;
-        box-shadow: 0 8px 25px rgba(0,0,0,0.1);
-        text-align: center;
-        transition: all 0.3s ease;
-        border-top: 5px solid #667eea;
-    }
-    
-    .metric-card:hover {
-        transform: translateY(-10px);
-        box-shadow: 0 15px 40px rgba(102, 126, 234, 0.25);
-    }
-    
-    .metric-value {
-        font-size: 3.5rem;
-        font-weight: 900;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin: 0.5rem 0;
-    }
-    
-    .metric-label {
-        font-size: 1.1rem;
-        color: #666;
-        font-weight: 500;
-        text-transform: uppercase;
-    }
-    
-    .interactive-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 12px;
-        border-left: 6px solid #667eea;
-        margin: 1rem 0;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-        cursor: pointer;
-        transition: all 0.3s ease;
-    }
-    
-    .interactive-card:hover {
-        transform: translateX(12px);
-        box-shadow: 0 8px 30px rgba(102, 126, 234, 0.2);
-    }
-    
-    .flow-inbound {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 0.5rem 1.2rem;
-        border-radius: 20px;
-        font-weight: 700;
-        display: inline-block;
-        font-size: 0.9rem;
-    }
-    
-    .flow-outbound {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        color: white;
-        padding: 0.5rem 1.2rem;
-        border-radius: 20px;
-        font-weight: 700;
-        display: inline-block;
-        font-size: 0.9rem;
-    }
-    
-    .flow-bidirectional {
-        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
-        color: white;
-        padding: 0.5rem 1.2rem;
-        border-radius: 20px;
-        font-weight: 700;
-        display: inline-block;
-        font-size: 0.9rem;
-    }
-    
-    .confidence-high {
-        background: linear-gradient(135deg, #38ef7d 0%, #11998e 100%);
-        color: white;
-        padding: 0.5rem 1.2rem;
-        border-radius: 20px;
-        font-weight: 700;
-        font-size: 0.85rem;
-    }
-    
-    .confidence-medium {
-        background: linear-gradient(135deg, #FFD26F 0%, #FF9800 100%);
-        color: white;
-        padding: 0.5rem 1.2rem;
-        border-radius: 20px;
-        font-weight: 700;
-        font-size: 0.85rem;
-    }
-    
-    .confidence-low {
-        background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);
-        color: white;
-        padding: 0.5rem 1.2rem;
-        border-radius: 20px;
-        font-weight: 700;
-        font-size: 0.85rem;
-    }
-    
-    .ai-insight {
-        background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
-        border-radius: 15px;
-        padding: 2rem;
-        margin: 2rem 0;
-        border-left: 8px solid #ff6b6b;
-    }
-    
-    .filter-panel {
-        background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
-        border-left: 5px solid #2196f3;
-        padding: 1.5rem;
-        border-radius: 12px;
-        margin: 1.5rem 0;
-    }
-    
-    .system-badge {
-        display: inline-block;
-        background: #e3f2fd;
-        color: #1976d2;
-        padding: 0.4rem 1rem;
-        border-radius: 15px;
-        margin: 0.3rem;
-        font-size: 0.9rem;
-        font-weight: 600;
-    }
+.hdr{background:linear-gradient(135deg,#667eea,#764ba2 50%,#f093fb);padding:2rem;border-radius:15px;text-align:center;margin-bottom:2rem;box-shadow:0 10px 30px rgba(102,126,234,.3)}
+.hdr h1{font-size:2.5rem;font-weight:800;color:#fff;margin:0}.hdr p{color:rgba(255,255,255,.8);margin:.5rem 0 0}
+.ch{background:#e8f5e9;color:#2e7d32;padding:3px 10px;border-radius:12px;font-weight:700;font-size:.8rem}
+.cm{background:#fff3e0;color:#ef6c00;padding:3px 10px;border-radius:12px;font-weight:700;font-size:.8rem}
+.cl{background:#fce4ec;color:#c2185b;padding:3px 10px;border-radius:12px;font-weight:700;font-size:.8rem}
+.phi3{background:linear-gradient(135deg,#e8eaf6,#c5cae9);border-radius:12px;padding:1.2rem;margin:.8rem 0;border-left:5px solid #3f51b5}
+.rules{background:linear-gradient(135deg,#ffecd2,#fcb69f);border-radius:12px;padding:1.2rem;margin:.8rem 0;border-left:5px solid #ff6b6b}
+.atag{display:inline-block;background:#e3f2fd;color:#1565c0;padding:2px 6px;border-radius:3px;font-size:.7rem;font-family:monospace}
+.stag{display:inline-block;padding:3px 8px;border-radius:5px;font-weight:600;font-size:.75rem;margin:2px}
+.s1{background:#e8f5e9;color:#2e7d32}.s2{background:#e3f2fd;color:#1565c0}
+.s3{background:#f3e5f5;color:#7b1fa2}.s4{background:#fff3e0;color:#e65100}
 </style>
 """, unsafe_allow_html=True)
 
-# ========================================================
-# SESSION STATE
-# ========================================================
+#  SESSION STATE 
+for k, v in {
+    'nav':'overview','interface_df':None,'sql_df':None,'mapping_df':None,
+    'pmim_df':None,'feeds_df':None,'audit_log':[],
+    'f_src':[],'f_tgt':[],'f_type':[],'f_app':[],
+}.items():
+    if k not in st.session_state: st.session_state[k] = v
 
-def initialize_session_state():
-    defaults = {
-        'navigation_level': 'overview',
-        'selected_source': None,
-        'selected_target': None,
-        'selected_interface': None,
-        'interface_df': None,
-        'pmim_df': None,
-        'pbfile_df': None,
-        'sql_df': None,
-        'mapping_df': None,
-        'lineage_graph': None,
-        'filter_source': [],
-        'filter_target': [],
-        'filter_flow_direction': [],
-        'filter_application': [],
-        'filter_type': [],
-        'embedding_model': None,
-        'llm_model': None,
-        'llm_tokenizer': None,
-        'embeddings_cache': {}
-    }
-    
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+#  UTILITIES 
+def ccol(c):
+    return str(c).strip().lower().replace(" ","_").replace("/","_").replace("-","_").replace("(","").replace(")","").replace("#","num").strip("_")
 
-initialize_session_state()
+def sg(row, col, default=""):
+    try:
+        val = row.get(col, default) if isinstance(row, dict) else getattr(row, col, default)
+        return val if pd.notna(val) and str(val) not in ('nan','None','') else default
+    except: return default
 
-# ========================================================
-# MODEL LOADING
-# ========================================================
+def norm(t):
+    return t.lower().replace("_","").replace(" ","").replace("-","").strip() if isinstance(t,str) else ""
+
+def alog(action, details):
+    st.session_state.audit_log.append({"ts":datetime.now().isoformat(),"action":action,"details":details})
+
+def apply_f(df):
+    d = df.copy()
+    if st.session_state.f_src and 'source_system' in d.columns: d=d[d['source_system'].isin(st.session_state.f_src)]
+    if st.session_state.f_tgt and 'target_system' in d.columns: d=d[d['target_system'].isin(st.session_state.f_tgt)]
+    if st.session_state.f_type and 'type' in d.columns: d=d[d['type'].isin(st.session_state.f_type)]
+    if st.session_state.f_app and 'application' in d.columns: d=d[d['application'].isin(st.session_state.f_app)]
+    return d
+
+#  MODELS 
+@st.cache_resource(show_spinner=False)
+def load_emb():
+    if not ML_OK: return None
+    try: return SentenceTransformer(EMB_PATH, device=DEVICE)
+    except Exception as e: st.warning(f"Embedding: {e}"); return None
 
 @st.cache_resource(show_spinner=False)
-def load_embedding_model():
+def load_phi3():
+    if not LLM_OK: return None
     try:
-        logger.info("Loading All-MiniLM-L6-v2 (optimized for 8GB GPU)")
-        device = gpu_manager.get_device(0)
-        
-        model_path = "C:/SEI/AneeshModel/all-minilm-l6-v2"
-        if not os.path.exists(model_path):
-            model_path = "sentence-transformers/all-MiniLM-L6-v2"
-        
-        # Load model with memory optimization
-        model = SentenceTransformer(model_path, device=device)
-        
-        # Clear cache after loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        logger.info(f"✅ Embedding model loaded on {device}")
-        logger.info(f"   {gpu_manager.get_memory_stats()}")
-        return model
-    except Exception as e:
-        logger.error(f"❌ Embedding load failed: {e}")
-        return None
+        tok = AutoTokenizer.from_pretrained(PHI3_PATH, trust_remote_code=True)
+        kw = {"torch_dtype":torch.float16,"trust_remote_code":True}
+        if DEVICE=="cuda":
+            try:
+                from transformers import BitsAndBytesConfig
+                kw["quantization_config"]=BitsAndBytesConfig(load_in_4bit=True,bnb_4bit_compute_dtype=torch.float16,bnb_4bit_quant_type="nf4")
+                kw["device_map"]="auto"
+            except: kw["device_map"]="auto"
+        else: kw["torch_dtype"]=torch.float32
+        mdl = AutoModelForCausalLM.from_pretrained(PHI3_PATH, **kw)
+        if DEVICE=="cpu": mdl=mdl.to("cpu")
+        return hf_pipeline("text-generation",model=mdl,tokenizer=tok,max_new_tokens=256,temperature=0.2,do_sample=True,top_p=0.9,repetition_penalty=1.1)
+    except Exception as e: st.warning(f"Phi-3: {e}"); return None
 
-@st.cache_resource(show_spinner=False)
-def load_llm_model():
+with st.sidebar:
+    st.markdown("### Model Status")
+    with st.spinner("Loading..."):
+        emb_model = load_emb()
+        phi3_pipe = load_phi3()
+    st.success("MiniLM ready") if emb_model else st.warning("Embedding N/A")
+    st.success("Phi-3 ready") if phi3_pipe else st.info("Phi-3 N/A (rule fallback)")
+
+#  PHI-3 ENGINE 
+def phi3(prompt, label="exp"):
+    if phi3_pipe is None: return None
     try:
-        logger.info("Loading Phi-3 with 4-bit quantization (optimized for 8GB GPU)")
-        device = gpu_manager.get_device(0)
-        
-        model_path = "C:/SEI/AneeshModel/phi-3-mini-4k-instruct"
-        if not os.path.exists(model_path):
-            model_path = "microsoft/Phi-3-mini-4k-instruct"
-        
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        
-        # Use 4-bit quantization to fit in 8GB VRAM
-        # This reduces memory from ~8GB to ~2GB
-        from transformers import BitsAndBytesConfig
-        
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
-        )
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            quantization_config=quantization_config,
-            device_map="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-        
-        # Clear cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        logger.info(f"✅ Phi-3 loaded (4-bit quantized) on {device}")
-        logger.info(f"   {gpu_manager.get_memory_stats()}")
-        return model, tokenizer
-    except ImportError:
-        logger.warning("⚠️ bitsandbytes not installed, loading in FP16 (may use more memory)")
-        try:
-            # Fallback: Load in FP16 without quantization
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
-            )
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            logger.info(f"✅ Phi-3 loaded (FP16) on {device}")
-            return model, tokenizer
-        except Exception as e:
-            logger.error(f"❌ Phi-3 load failed: {e}")
-            return None, None
-    except Exception as e:
-        logger.error(f"❌ Phi-3 load failed: {e}")
-        return None, None
+        fmt = f"<|system|>\nYou are a senior data engineer in regulated banking/asset management. Be concise. Focus on business meaning, data flow, risk. Do NOT change scores or decisions.<|end|>\n<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
+        r = phi3_pipe(fmt, return_full_text=False)
+        txt = r[0]['generated_text'].strip()
+        alog("phi3",{"label":label,"plen":len(prompt),"rlen":len(txt)})
+        return txt
+    except: return None
 
-# ========================================================
-# DATA LOADING
-# ========================================================
+def biz_explain(ir, sr, tables, analysis):
+    app=sg(ir,'application','system'); integ=sg(ir,'integration','interface')
+    desc=sg(ir,'description',''); src=sg(ir,'source_system','source')
+    tgt=sg(ir,'target_system','target'); dirn=sg(ir,'inbound_outbound','')
+    qn=sg(sr,'queryname','query')
 
-def load_excel_file(file, sheet_name=None):
+    p = f"Explain business purpose:\nInterface: {integ}\nApp: {app}\nDesc: {desc}\nSource: {src} -> Target: {tgt}\nDirection: {dirn}\nSQL: {qn}\nTables: {', '.join(tables[:5]) if tables else 'N/A'}\nComplexity: {analysis.get('complexity','?')}\n\nProvide: 1) Business purpose 2) Data flow 3) Value 4) Risks"
+    r = phi3(p, "biz")
+    if r: return r, "phi3"
+
+    exp = f"**Business Purpose:** {desc or f'Interface ({integ}) transfers data {src} -> {tgt}.'}\n\n"
+    exp += f"**Data Flow:** From {app}"
+    if dirn: exp += f" ({dirn})"
+    if tables: exp += f", {len(tables)} table(s): {', '.join(tables[:3])}"
+    exp += ".\n\n**Value:** "
+    ql = qn.lower()
+    if any(w in ql for w in ['customer','client','account']): exp+="CRM and account tracking."
+    elif any(w in ql for w in ['transaction','trade','payment']): exp+="Transaction processing."
+    elif any(w in ql for w in ['position','holding','portfolio']): exp+="Portfolio management."
+    elif any(w in ql for w in ['balance','reconciliation']): exp+="Balance tracking and reconciliation."
+    else: exp+="Critical data integration."
+    return exp, "rules"
+
+def tech_explain(sr, tables, analysis):
+    qn=sg(sr,'queryname','Query'); sqlt=sg(sr,'sqltext',''); sys_=sg(sr,'system','')
+    if sqlt and len(sqlt)>30:
+        p = f"Explain this SQL in banking context:\nQuery: {qn}\nSystem: {sys_}\nSQL:\n{sqlt[:1500]}\n\nProvide: 1) What it retrieves 2) Key joins 3) CASE WHEN logic 4) Risks"
+        r = phi3(p, "tech")
+        if r: return r, "phi3"
+
+    exp = f"**Query:** `{qn}`\n"
+    if sys_: exp += f"**System:** {sys_}\n"
+    exp += f"**Complexity:** {analysis.get('complexity','?')}\n\n"
+    if tables: exp += f"**Tables:** {', '.join(f'`{t}`' for t in tables[:5])}\n\n"
+    if analysis.get('joins'): exp += f"- {len(analysis['joins'])} join(s)\n"
+    if analysis.get('has_subquery'): exp += "- Subqueries\n"
+    if analysis.get('has_group_by'): exp += "- Aggregation\n"
+    if analysis.get('has_case_when'): exp += "- CASE WHEN logic\n"
+    return exp, "rules"
+
+def case_explain(blocks):
+    if not blocks or not phi3_pipe: return None
+    return phi3(f"Explain these CASE WHEN blocks in business terms:\n\n"+"\n\n".join(blocks[:3]), "case")
+
+def risk_explain(ir, analysis):
+    if not phi3_pipe: return None
+    return phi3(f"Analyze risks:\nInterface: {sg(ir,'integration')}\n{sg(ir,'source_system')}->{sg(ir,'target_system')}\nTables: {','.join(analysis.get('tables',[])[:5])}\nComplexity: {analysis.get('complexity','?')}\n\nIdentify: data quality, regulatory, operational risks, recommendations", "risk")
+
+#  SQL ANALYSIS 
+def analyze_sql(sql):
+    a = {'tables':[],'joins':[],'has_subquery':False,'has_union':False,'has_group_by':False,'has_order_by':False,'has_case_when':False,'case_when_blocks':[],'complexity':'Low','where_conditions':''}
+    if not sql or not isinstance(sql,str): return a
+    up = sql.upper()
+    a['tables'] = list(set(t.strip() for t in re.findall(r'FROM\s+([^\s,;()\n]+)',up)+re.findall(r'JOIN\s+([^\s,;()\n]+)',up) if t.strip()))
+    a['joins'] = re.findall(r'\bJOIN\b',up)
+    a['has_subquery'] = '(SELECT' in up or up.strip().startswith('WITH ')
+    a['has_union'] = 'UNION' in up
+    a['has_group_by'] = 'GROUP BY' in up
+    a['has_case_when'] = 'CASE' in up and 'WHEN' in up
+    a['case_when_blocks'] = re.findall(r'CASE\s+.*?END',sql,re.IGNORECASE|re.DOTALL)[:3]
+    wh = re.search(r'WHERE\s+(.+?)(?:GROUP BY|ORDER BY|LIMIT|HAVING|$)',up,re.DOTALL)
+    if wh: a['where_conditions']=wh.group(1)[:300]
+    sc = len(a['tables'])*2+len(a['joins'])*3+(10 if a['has_subquery'] else 0)+(5 if a['has_group_by'] else 0)+(5 if a['has_union'] else 0)+(5 if a['has_case_when'] else 0)
+    a['complexity'] = 'High' if sc>=25 else ('Medium' if sc>=10 else 'Low')
+    return a
+
+#  DATA LOADING 
+def load_ifile(file):
+    xls = pd.ExcelFile(file); sheets = xls.sheet_names
+    st.info(f"Sheets: {', '.join(sheets)}")
+
+    idf = None
+    for name in ['Interface','interface','Interfaces','Sheet1']:
+        if name in sheets:
+            idf = pd.read_excel(file, sheet_name=name)
+            idf.columns = [ccol(c) for c in idf.columns]
+            idf = idf.dropna(axis=1, how='all')
+            idf = idf.loc[:, ~idf.columns.str.contains("^unnamed")]
+            for std, vs in {
+                'application':['application','app'],'integration':['integration','interface','interfacename','interface_name'],
+                'description':['description','desc','interfacedescription','interface_description'],
+                'type':['type'],'source_system':['source_system','source','sourcesystem'],
+                'target_system':['target_system','target','targetsystem'],
+                'inbound_outbound':['inbound_outbound','inbound_outbound_with_respect_to_existing_acct_platform','integrationdirection','integration_direction','direction'],
+                'frequency':['frequency'],'owner':['application_owner_contact','owner','contact'],
+            }.items():
+                for v in vs:
+                    if v in idf.columns and std not in idf.columns: idf[std]=idf[v]; break
+            for col in idf.select_dtypes(include=['object']).columns:
+                idf[col]=idf[col].astype(str).str.strip().replace({'nan':'','None':'','NaN':''})
+            st.success(f"Interface: {len(idf)} rows ('{name}')"); alog("load_interface",{"sheet":name,"rows":len(idf)}); break
+    if idf is None: st.error("Interface sheet not found"); return None,None,None
+
+    pmim = None
+    for name in ['PMIMCurrentSystem','PMIM','Systems','CurrentSystem']:
+        if name in sheets:
+            pmim=pd.read_excel(file,sheet_name=name); pmim.columns=[ccol(c) for c in pmim.columns]
+            st.info(f"PMIM: {len(pmim)} systems"); alog("load_pmim",{"rows":len(pmim)}); break
+
+    feeds = None
+    for name in ['PB_Files_Feeds_ORIG','PB_Files_Feeds','Feeds','Files_Feeds']:
+        if name in sheets:
+            feeds=pd.read_excel(file,sheet_name=name); feeds.columns=[ccol(c) for c in feeds.columns]
+            st.info(f"Feeds: {len(feeds)} records"); alog("load_feeds",{"rows":len(feeds)}); break
+
+    return idf, pmim, feeds
+
+def load_sfile(file):
+    for sh in ["Queries","Sheet1","SQL","Output"]:
+        try: df=pd.read_excel(file,sheet_name=sh); st.success(f"SQL: {len(df)} queries ('{sh}')"); break
+        except: continue
+    else: df=pd.read_excel(file)
+    df.columns=[ccol(c) for c in df.columns]
+    for std,vs in {'system':['system'],'file':['file','filename'],'queryname':['queryname','query_name','query'],'tables':['tables','table'],'selectcolumnscount':['selectcolumnscount','select_columns_count'],'selectcolumns':['selectcolumns','select_columns'],'sqltext':['sqltext','sql_text','sql','query_text'],'type':['type']}.items():
+        for v in vs:
+            if v in df.columns and std not in df.columns: df[std]=df[v]; break
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col]=df[col].astype(str).str.strip().replace({'nan':'','None':''})
+    alog("load_sql",{"rows":len(df)}); return df
+
+#  4-STEP ENGINE 
+
+def step1(ir, sr):
+    s=0; d=[]
+    app=norm(sg(ir,'application')); integ=norm(sg(ir,'integration')); desc=norm(sg(ir,'description'))
+    src=norm(sg(ir,'source_system')); itype=norm(sg(ir,'type'))
+    qn=norm(sg(sr,'queryname')); sf=norm(sg(sr,'file')); ssys=norm(sg(sr,'system'))
+    stbl=norm(sg(sr,'tables')); stype=norm(sg(sr,'type'))
+
+    if app and ssys and (app==ssys or app in ssys or ssys in app): s+=15; d.append(f"App matches System ({app})")
+    if integ:
+        iw=set(integ.split())
+        if qn and (integ in qn or qn in integ): s+=15; d.append("InterfaceName~QueryName")
+        elif qn:
+            c=iw&set(qn.split())
+            if c: s+=min(len(c)*4,10); d.append(f"InterfaceName words in QN ({len(c)})")
+        if sf and (integ in sf or sf in integ): s+=5; d.append("InterfaceName~FileName")
+        elif sf:
+            c=iw&set(sf.split())
+            if c: s+=min(len(c)*2,5); d.append(f"InterfaceName words in FN ({len(c)})")
+    if src and stbl and src in stbl: s+=10; d.append("SourceSystem in Tables")
+    if itype and stype and (itype==stype or itype in stype): s+=5; d.append("Type match")
+    if desc and qn:
+        c=set(desc.split())&set(qn.split())
+        if c: s+=min(len(c)*2,10); d.append(f"Desc words in QN ({len(c)})")
+    return min(s,60), d
+
+def step2(ir, feeds):
+    if feeds is None or feeds.empty: return 0, ["No feeds sheet"]
+    pen=0; d=[]; src=sg(ir,'source_system','').lower(); tgt=sg(ir,'target_system','').lower(); dirn=sg(ir,'inbound_outbound','').lower()
+    matched=feeds[feeds.apply(lambda f:(src and src in str(sg(f,'source_system','')).lower()) or (tgt and tgt in str(sg(f,'target_system','')).lower()),axis=1)]
+    if matched.empty: return 0,["No matching feed"]
+    for _,f in matched.iterrows():
+        fd=str(sg(f,'inbound_outbound_with_respect_to_addv','')).lower() or str(sg(f,'in_out_with_respect_to_app','')).lower()
+        if dirn and fd:
+            if ('inbound' in dirn and 'outbound' in fd) or ('outbound' in dirn and 'inbound' in fd):
+                pen=-10; d.append("DOWNGRADE: direction mismatch"); break
+            else: d.append("Feed direction OK")
+        flow=str(sg(f,'direct_indirect_feeds_flow','')).lower()
+        if flow: d.append(f"Flow: {flow}")
+    return pen, d
+
+def step3(ii, si, ie, se):
+    if ie is None or se is None: return 0,["Semantic N/A"],0.0
     try:
-        if sheet_name:
-            df = pd.read_excel(file, sheet_name=sheet_name)
-        else:
-            df = pd.read_excel(file)
-        
-        df.columns = df.columns.str.strip()
-        logger.info(f"✅ Loaded {len(df)} rows, {len(df.columns)} columns")
-        return df
-    except Exception as e:
-        logger.error(f"❌ Load error: {e}")
-        st.error(f"Error: {e}")
-        return None
+        sim=float(np.dot(ie[ii],se[si]))
+        if sim>=.85: return 25,[f"Excellent ({sim:.3f})"],sim
+        elif sim>=.75: return 20,[f"Very high ({sim:.3f})"],sim
+        elif sim>=.65: return 15,[f"High ({sim:.3f})"],sim
+        elif sim>=.55: return 10,[f"Good ({sim:.3f})"],sim
+        elif sim>=.45: return 5,[f"Moderate ({sim:.3f})"],sim
+        return 0,[f"Low ({sim:.3f})"],sim
+    except: return 0,["Error"],0.0
 
-# ========================================================
-# SEMANTIC MATCHING
-# ========================================================
+def step4(s1,s2,s3,d1,d2,d3,sim):
+    raw=s1+s2+s3; final=max(0,min(100,raw))
+    if s1>=30 and final>=70: conf="HIGH"
+    elif s1>=15 and final>=45: conf="MEDIUM"
+    else: conf="LOW"
+    ad = [f"<span class='stag s1'>S1 Deterministic: {s1}/60</span>"]+[f"  {x}" for x in d1]+\
+         [f"<span class='stag s2'>S2 Feed: {s2}</span>"]+[f"  {x}" for x in d2]+\
+         [f"<span class='stag s3'>S3 Semantic: {s3}/25 (sim={sim:.3f})</span>"]+[f"  {x}" for x in d3]+\
+         [f"<span class='stag s4'>S4 Final: {final}/100 -> {conf}</span>"]
+    return final, conf, ad
 
-class SemanticMatcher:
-    def __init__(self, embedding_model):
-        self.embedding_model = embedding_model
-        self.cache = {}
-    
-    def get_embedding(self, text: str):
-        if pd.isna(text) or str(text).strip() == "":
-            return None
-        
-        text_key = str(text).strip()
-        if text_key in self.cache:
-            return self.cache[text_key]
-        
-        with torch.no_grad():
-            embedding = self.embedding_model.encode(
-                text_key,
-                convert_to_tensor=True,
-                show_progress_bar=False
-            )
-        
-        self.cache[text_key] = embedding
-        return embedding
-    
-    def compute_similarity(self, text1: str, text2: str) -> float:
-        emb1 = self.get_embedding(text1)
-        emb2 = self.get_embedding(text2)
-        
-        if emb1 is None or emb2 is None:
-            return 0.0
-        
-        return util.cos_sim(emb1, emb2).item()
-    
-    def batch_similarity(self, query_text: str, corpus_texts: List[str], top_k: int = 10):
-        query_emb = self.get_embedding(query_text)
-        if query_emb is None:
-            return []
-        
-        corpus_embs = []
-        valid_indices = []
-        
-        for idx, text in enumerate(corpus_texts):
-            emb = self.get_embedding(text)
-            if emb is not None:
-                corpus_embs.append(emb)
-                valid_indices.append(idx)
-        
-        if not corpus_embs:
-            return []
-        
-        corpus_embs = torch.stack(corpus_embs)
-        similarities = util.cos_sim(query_emb, corpus_embs)[0]
-        top_results = torch.topk(similarities, k=min(top_k, len(similarities)))
-        
-        results = []
-        for score, idx in zip(top_results.values.tolist(), top_results.indices.tolist()):
-            results.append({
-                'index': valid_indices[idx],
-                'text': corpus_texts[valid_indices[idx]],
-                'score': score
-            })
-        
-        return results
+#  MAPPING 
+def gen_mapping(idf, sdf, feeds, pmim, min_sc=40, use_sem=True):
+    results=[]; st.write(f"Interfaces: {len(idf)} | SQL: {len(sdf)} | Semantic: {'ON' if use_sem and emb_model else 'OFF'}")
 
-# ========================================================
-# INTERFACE-SQL MAPPING
-# ========================================================
+    ie=se=None
+    if use_sem and emb_model:
+        st.write("Computing embeddings...")
+        it=[f"{sg(r,'application')} {sg(r,'integration')} {sg(r,'description')}".strip() or "unknown" for _,r in idf.iterrows()]
+        st_=[f"{sg(r,'queryname')} {sg(r,'file')} {str(sg(r,'sqltext',''))[:200]}".strip() or "unknown" for _,r in sdf.iterrows()]
+        ie=emb_model.encode(it,batch_size=32,normalize_embeddings=True,convert_to_numpy=True,show_progress_bar=False)
+        se=emb_model.encode(st_,batch_size=32,normalize_embeddings=True,convert_to_numpy=True,show_progress_bar=False)
+        st.success("Embeddings ready")
 
-def generate_interface_sql_mapping(interface_df, sql_df, matcher, min_confidence=0.45):
-    mappings = []
-    
-    with st.spinner("🔍 Analyzing interfaces and SQL..."):
-        progress_bar = st.progress(0)
-        
-        for idx, interface_row in interface_df.iterrows():
-            progress_bar.progress((idx + 1) / len(interface_df))
-            
-            interface_context = []
-            for col in ['Application', 'Integration', 'Description', 'Source System', 'Target System']:
-                if col in interface_row and pd.notna(interface_row[col]):
-                    interface_context.append(str(interface_row[col]))
-            
-            interface_text = " ".join(interface_context)
-            if not interface_text.strip():
-                continue
-            
-            sql_corpus = []
-            for _, sql_row in sql_df.iterrows():
-                sql_context = [str(sql_row[col]) for col in sql_df.columns if pd.notna(sql_row[col])]
-                sql_corpus.append(" ".join(sql_context))
-            
-            matches = matcher.batch_similarity(interface_text, sql_corpus, top_k=5)
-            
-            for match in matches:
-                if match['score'] >= min_confidence:
-                    sql_row = sql_df.iloc[match['index']]
-                    
-                    mapping = {
-                        'Interface_Index': idx,
-                        'SQL_Index': match['index'],
-                        'Confidence_Score': match['score'],
-                        'Application': interface_row.get('Application', ''),
-                        'Integration': interface_row.get('Integration', ''),
-                        'Source_System': interface_row.get('Source System', ''),
-                        'Target_System': interface_row.get('Target System', ''),
-                        'Flow_Direction': interface_row.get('Inbound/Outbound With Respect To Existing Acct Platform', ''),
-                        'SQL_System': sql_row.get('system', sql_row.get('System', '')),
-                        'SQL_File': sql_row.get('file', sql_row.get('File', '')),
-                        'SQL_Query_Name': sql_row.get('queryname', sql_row.get('QueryName', ''))
-                    }
-                    
-                    mappings.append(mapping)
-        
-        progress_bar.empty()
-    
-    if mappings:
-        mapping_df = pd.DataFrame(mappings)
-        return mapping_df.sort_values('Confidence_Score', ascending=False)
-    return pd.DataFrame()
+    prog=st.progress(0); mc=0; total=len(idf)
+    for idx,(_,ir) in enumerate(idf.iterrows()):
+        prog.progress((idx+1)/total)
+        for si,(_,sr) in enumerate(sdf.iterrows()):
+            s1,d1=step1(ir,sr)
+            s2,d2=step2(ir,feeds)
+            s3,d3,sim=step3(idx,si,ie,se)
+            final,conf,ad=step4(s1,s2,s3,d1,d2,d3,sim)
+            if final>=min_sc:
+                mc+=1
+                results.append({
+                    'application':sg(ir,'application'),'integration':sg(ir,'integration'),
+                    'description':sg(ir,'description'),'type':sg(ir,'type'),
+                    'source_system':sg(ir,'source_system'),'target_system':sg(ir,'target_system'),
+                    'inbound_outbound':sg(ir,'inbound_outbound'),
+                    'sql_system':sg(sr,'system'),'sql_file':sg(sr,'file'),
+                    'queryname':sg(sr,'queryname'),'tables':sg(sr,'tables'),
+                    'sqltext':sg(sr,'sqltext',''),
+                    'step1_score':s1,'step2_score':s2,'step3_score':s3,
+                    'semantic_similarity':round(sim,4),'final_score':final,
+                    'confidence':conf,'match_details':'\n'.join(ad),
+                })
+                alog("match",{"intf":sg(ir,'integration'),"qry":sg(sr,'queryname'),"s1":s1,"s2":s2,"s3":s3,"sim":round(sim,4),"final":final,"conf":conf})
+    prog.empty(); st.success(f"Found {mc} matches")
+    df=pd.DataFrame(results)
+    if df.empty:
+        df=pd.DataFrame(columns=['application','integration','description','type','source_system','target_system','inbound_outbound','sql_system','sql_file','queryname','tables','sqltext','step1_score','step2_score','step3_score','semantic_similarity','final_score','confidence','match_details'])
+    return df
 
-# ========================================================
-# GRAPH VISUALIZATION
-# ========================================================
+#  LINEAGE GRAPH 
+def build_graph(mdf):
+    if not GRAPH_OK or mdf is None or mdf.empty: st.warning("Graph needs plotly/networkx and data"); return
+    G=nx.DiGraph()
+    for _,r in mdf.iterrows():
+        integ=sg(r,'integration','?'); src=sg(r,'source_system','?src'); tgt=sg(r,'target_system','?tgt')
+        qn=sg(r,'queryname',''); tbls=sg(r,'tables','')
+        G.add_node(integ,ntype='interface',color='#667eea')
+        G.add_node(src,ntype='source',color='#48bb78')
+        G.add_node(tgt,ntype='target',color='#ed8936')
+        G.add_edge(integ,src); G.add_edge(integ,tgt)
+        if qn:
+            G.add_node(qn,ntype='sql',color='#9f7aea')
+            G.add_edge(tgt if tgt!='?tgt' else src,qn)
+            for t in str(tbls).split(',')[:5]:
+                t=t.strip()
+                if t and t!='nan':
+                    G.add_node(t,ntype='table',color='#fc8181')
+                    G.add_edge(qn,t)
+    if not G.nodes: return
+    pos=nx.spring_layout(G,k=2,iterations=50,seed=42)
+    ex,ey=[],[]
+    for u,v in G.edges():
+        x0,y0=pos[u];x1,y1=pos[v];ex+=[x0,x1,None];ey+=[y0,y1,None]
+    et=go.Scatter(x=ex,y=ey,mode='lines',line=dict(width=1,color='#cbd5e0'),hoverinfo='none')
+    nx_,ny_,nt_,nc_,ns_=[],[],[],[],[]
+    sizes={'interface':25,'source':20,'target':20,'sql':18,'table':14}
+    for n in G.nodes():
+        x,y=pos[n];nx_.append(x);ny_.append(y)
+        nt_.append(f"{n}<br>{G.nodes[n].get('ntype','')}")
+        nc_.append(G.nodes[n].get('color','#a0aec0'))
+        ns_.append(sizes.get(G.nodes[n].get('ntype',''),12))
+    nt=go.Scatter(x=nx_,y=ny_,mode='markers+text',marker=dict(size=ns_,color=nc_,line=dict(width=1,color='white')),text=[n for n in G.nodes()],textposition='top center',textfont=dict(size=9),hovertext=nt_,hoverinfo='text')
+    fig=go.Figure(data=[et,nt],layout=go.Layout(title="Lineage: Interface -> Source -> Target -> SQL -> Tables",showlegend=False,hovermode='closest',xaxis=dict(showgrid=False,zeroline=False,showticklabels=False),yaxis=dict(showgrid=False,zeroline=False,showticklabels=False),height=600,margin=dict(l=20,r=20,t=50,b=20),paper_bgcolor='#f7fafc',plot_bgcolor='#f7fafc'))
+    st.plotly_chart(fig,use_container_width=True)
+    st.caption(f"Nodes: {len(G.nodes)} | Edges: {len(G.edges)}")
 
-def create_data_lineage_graph(interface_df, flow_col='Inbound/Outbound With Respect To Existing Acct Platform'):
-    G = nx.DiGraph()
-    
-    colors = {
-        'Inbound': '#667eea',
-        'Outbound': '#f5576c',
-        'Bidirectional': '#38ef7d',
-        'Unknown': '#95a5a6'
-    }
-    
-    edge_data = []
-    node_data = {}
-    
-    for _, row in interface_df.iterrows():
-        source = str(row.get('Source System', 'Unknown')).strip()
-        target = str(row.get('Target System', 'Unknown')).strip()
-        flow = str(row.get(flow_col, 'Unknown')).strip() if pd.notna(row.get(flow_col)) else 'Unknown'
-        
-        if pd.isna(row.get('Source System')) or pd.isna(row.get('Target System')):
-            continue
-        
-        flow_normalized = 'Unknown'
-        if 'inbound' in flow.lower():
-            flow_normalized = 'Inbound'
-        elif 'outbound' in flow.lower():
-            flow_normalized = 'Outbound'
-        elif 'bi' in flow.lower():
-            flow_normalized = 'Bidirectional'
-        
-        for node in [source, target]:
-            if node not in node_data:
-                node_data[node] = {'size': 0, 'connections': set()}
-            node_data[node]['size'] += 1
-        
-        node_data[source]['connections'].add(target)
-        node_data[target]['connections'].add(source)
-        
-        edge_info = {
-            'source': source,
-            'target': target,
-            'flow': flow_normalized,
-            'color': colors[flow_normalized],
-            'application': row.get('Application', ''),
-            'integration': row.get('Integration', '')
-        }
-        edge_data.append(edge_info)
-        
-        G.add_edge(source, target, flow=flow_normalized, color=edge_info['color'])
-    
-    try:
-        pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
-    except:
-        pos = nx.random_layout(G, seed=42)
-    
-    edge_traces = []
-    for flow_type, color in colors.items():
-        edges = [e for e in edge_data if e['flow'] == flow_type]
-        if not edges:
-            continue
-        
-        edge_x, edge_y = [], []
-        for edge in edges:
-            x0, y0 = pos[edge['source']]
-            x1, y1 = pos[edge['target']]
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
-        
-        edge_traces.append(go.Scatter(
-            x=edge_x, y=edge_y,
-            line=dict(width=2, color=color),
-            hoverinfo='none',
-            mode='lines',
-            name=flow_type,
-            showlegend=True
-        ))
-    
-    node_x, node_y, node_text, node_size, node_color = [], [], [], [], []
-    for node in G.nodes():
-        x, y = pos[node]
-        node_x.append(x)
-        node_y.append(y)
-        
-        size = node_data[node]['size']
-        node_size.append(20 + size * 5)
-        node_color.append(G.degree(node))
-        
-        connections = len(node_data[node]['connections'])
-        node_text.append(f"{node}<br>Interfaces: {size}<br>Connections: {connections}")
-    
-    node_trace = go.Scatter(
-        x=node_x, y=node_y,
-        mode='markers+text',
-        hoverinfo='text',
-        text=[n.split()[-1] if len(n) > 15 else n for n in G.nodes()],
-        textposition="top center",
-        hovertext=node_text,
-        marker=dict(
-            showscale=True,
-            colorscale='Viridis',
-            size=node_size,
-            color=node_color,
-            line=dict(width=2, color='white'),
-            colorbar=dict(title="Connections", thickness=15)
-        ),
-        showlegend=False
-    )
-    
-    fig = go.Figure(
-        data=edge_traces + [node_trace],
-        layout=go.Layout(
-            title='<b>Data Lineage Graph - Color-Coded by Flow Direction</b>',
-            showlegend=True,
-            hovermode='closest',
-            margin=dict(b=20, l=5, r=5, t=60),
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            plot_bgcolor='#f8f9fa',
-            height=700,
-            legend=dict(y=0.99, x=0.99, bgcolor="rgba(255,255,255,0.9)")
-        )
-    )
-    
-    return fig, G
+#  OVERVIEW PAGE 
+def render_overview():
+    st.markdown('<div class="hdr"><h1>Data Explorer 360</h1><p>Bank-Grade Semantic Lineage</p></div>',unsafe_allow_html=True)
+    idf=apply_f(st.session_state.interface_df); mdf=st.session_state.mapping_df
+    fc=sum(len(v) for v in [st.session_state.f_src,st.session_state.f_tgt,st.session_state.f_type,st.session_state.f_app])
+    if fc: st.info(f"Filters active: {fc} | Showing {len(idf)}/{len(st.session_state.interface_df)} interfaces")
 
-# ========================================================
-# PHI-3 INSIGHTS
-# ========================================================
+    c1,c2,c3,c4,c5=st.columns(5)
+    with c1: st.metric("Interfaces",len(idf))
+    with c2: st.metric("SQL Queries",len(st.session_state.sql_df) if st.session_state.sql_df is not None else 0)
+    with c3: st.metric("Mappings",len(mdf) if mdf is not None else 0)
+    with c4: st.metric("High Conf",len(mdf[mdf['confidence']=='HIGH']) if mdf is not None and 'confidence' in mdf.columns else 0)
+    with c5: st.metric("Audit Log",len(st.session_state.audit_log))
 
-def generate_phi3_insights(llm_model, llm_tokenizer, interface_row, sql_info=None):
-    if llm_model is None or llm_tokenizer is None:
-        return generate_rule_based_insights(interface_row, sql_info)
-    
-    prompt_parts = ["Generate business insights for this integration:\n\n"]
-    
-    for col in ['Application', 'Integration', 'Description', 'Source System', 'Target System', 
-                'Inbound/Outbound With Respect To Existing Acct Platform']:
-        if col in interface_row and pd.notna(interface_row[col]):
-            prompt_parts.append(f"{col}: {interface_row[col]}\n")
-    
-    if sql_info:
-        prompt_parts.append(f"\nSQL Tables: {', '.join(sql_info.get('tables', []))}\n")
-    
-    prompt_parts.append("\nProvide:\n1. Business purpose\n2. Data flow\n3. Benefits\n4. Risks")
-    prompt = "".join(prompt_parts)
-    
-    try:
-        inputs = llm_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(llm_model.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = llm_model.generate(
-                **inputs,
-                max_new_tokens=500,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=llm_tokenizer.eos_token_id
-            )
-        
-        response = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        if prompt in response:
-            response = response.replace(prompt, "").strip()
-        
-        return response
-    except Exception as e:
-        logger.error(f"Phi-3 error: {e}")
-        return generate_rule_based_insights(interface_row, sql_info)
+    t1,t2,t3,t4,t5=st.tabs(["Mapping Results","Lineage Graph","Interface Explorer","Audit Log","Phi-3 Insights"])
 
-def generate_rule_based_insights(interface_row, sql_info=None):
-    insights = ["**Business Purpose:**"]
-    
-    if 'Description' in interface_row and pd.notna(interface_row['Description']):
-        insights.append(interface_row['Description'])
-    else:
-        insights.append(f"Data integration for {interface_row.get('Application', 'the system')}")
-    
-    insights.append("\n**Data Flow:**")
-    source = interface_row.get('Source System', 'source')
-    target = interface_row.get('Target System', 'target')
-    flow = interface_row.get('Inbound/Outbound With Respect To Existing Acct Platform', '')
-    
-    if 'inbound' in str(flow).lower():
-        insights.append(f"FROM {source} INTO account platform ({target})")
-    elif 'outbound' in str(flow).lower():
-        insights.append(f"FROM account platform TO {target}")
-    else:
-        insights.append(f"Between {source} and {target}")
-    
-    if sql_info and sql_info.get('tables'):
-        insights.append(f"\n**Data Sources:** {len(sql_info['tables'])} tables")
-    
-    insights.append("\n**Benefits:**")
-    insights.append("• Automated sync\n• Reduced errors\n• Data consistency")
-    
-    return "\n".join(insights)
+    with t1:
+        if mdf is not None and not mdf.empty:
+            cf=st.multiselect("Confidence",["HIGH","MEDIUM","LOW"],default=["HIGH","MEDIUM","LOW"])
+            fd=mdf[mdf['confidence'].isin(cf)]
+            if st.session_state.f_src: fd=fd[fd['source_system'].isin(st.session_state.f_src)]
+            if st.session_state.f_tgt: fd=fd[fd['target_system'].isin(st.session_state.f_tgt)]
+            st.write(f"{len(fd)} mappings")
+            cc=st.columns(3)
+            with cc[0]: st.metric("HIGH",len(fd[fd['confidence']=='HIGH']))
+            with cc[1]: st.metric("MEDIUM",len(fd[fd['confidence']=='MEDIUM']))
+            with cc[2]: st.metric("LOW",len(fd[fd['confidence']=='LOW']))
+            dcols=[c for c in ['integration','application','source_system','target_system','queryname','sql_file','final_score','confidence','step1_score','step2_score','step3_score','semantic_similarity'] if c in fd.columns]
+            st.dataframe(fd[dcols].sort_values('final_score',ascending=False),use_container_width=True,height=400)
+            st.markdown("---"); st.subheader("Match Details")
+            for _,row in fd.head(20).iterrows():
+                with st.expander(f"{sg(row,'integration')} <-> {sg(row,'queryname')} (Score:{sg(row,'final_score')}, {sg(row,'confidence')})"):
+                    c1,c2=st.columns(2)
+                    with c1: st.markdown("**Interface**"); st.write(f"App: {sg(row,'application')}"); st.write(f"Source: {sg(row,'source_system')}"); st.write(f"Target: {sg(row,'target_system')}"); st.write(f"Type: {sg(row,'type')}")
+                    with c2: st.markdown("**SQL**"); st.write(f"System: {sg(row,'sql_system')}"); st.write(f"File: {sg(row,'sql_file')}"); st.write(f"Query: {sg(row,'queryname')}"); st.write(f"Tables: {sg(row,'tables')}")
+                    st.markdown("**Scoring**"); st.markdown(sg(row,'match_details',''),unsafe_allow_html=True)
+        else: st.info("Generate mappings first via sidebar.")
 
-# ========================================================
-# MAIN APPLICATION
-# ========================================================
+    with t2:
+        if mdf is not None and not mdf.empty: build_graph(mdf)
+        else: st.info("Generate mappings to see lineage graph.")
 
+    with t3:
+        srch=st.text_input("Search","")
+        disp=idf
+        if srch: disp=idf[idf.apply(lambda r:srch.lower() in str(r.values).lower(),axis=1)]
+        st.dataframe(disp,use_container_width=True,height=400)
+
+    with t4:
+        st.caption("All decisions, scores, Phi-3 calls logged for governance.")
+        if st.session_state.audit_log:
+            adf=pd.DataFrame(st.session_state.audit_log)
+            st.dataframe(adf,use_container_width=True,height=400)
+            if st.button("Export Audit JSON"):
+                adf.to_json("audit_log.json",orient='records',indent=2)
+                st.success("Saved audit_log.json")
+        else: st.info("No entries yet.")
+
+    with t5:
+        st.subheader("Phi-3 Insights")
+        if phi3_pipe: st.success("Phi-3 available for explanations")
+        else: st.warning(f"Phi-3 not loaded. Path: {PHI3_PATH}"); st.info("Using rule-based fallback")
+        if mdf is not None and not mdf.empty:
+            st.markdown("---")
+            sel=st.selectbox("Select mapping",range(min(20,len(mdf))),format_func=lambda i:f"{sg(mdf.iloc[i],'integration')} <-> {sg(mdf.iloc[i],'queryname')} ({sg(mdf.iloc[i],'confidence')})")
+            if st.button("Generate Explanation"):
+                row=mdf.iloc[sel]; rd=row.to_dict()
+                tbls=str(sg(row,'tables','')).split(',')
+                sqlt=sg(row,'sqltext','')
+                an=analyze_sql(sqlt) if sqlt else {'tables':tbls,'complexity':'Unknown','joins':[],'has_subquery':False,'has_group_by':False,'has_case_when':False,'case_when_blocks':[]}
+
+                c1,c2=st.columns(2)
+                with c1:
+                    st.markdown("**Business Explanation**")
+                    bx,bs=biz_explain(rd,rd,tbls,an)
+                    cls="phi3" if bs=="phi3" else "rules"; lbl="Phi-3 AI" if bs=="phi3" else "Rule-Based"
+                    st.markdown(f'<div class="{cls}"><small class="atag">{lbl}</small><br><br>{bx}</div>',unsafe_allow_html=True)
+                with c2:
+                    st.markdown("**Technical Explanation**")
+                    tx,ts=tech_explain(rd,tbls,an)
+                    cls="phi3" if ts=="phi3" else "rules"; lbl="Phi-3 AI" if ts=="phi3" else "Rule-Based"
+                    st.markdown(f'<div class="{cls}"><small class="atag">{lbl}</small><br><br>{tx}</div>',unsafe_allow_html=True)
+
+                if an.get('case_when_blocks'):
+                    st.markdown("**CASE WHEN Logic**")
+                    cx=case_explain(an['case_when_blocks'])
+                    if cx: st.markdown(f'<div class="phi3"><small class="atag">Phi-3 AI</small><br><br>{cx}</div>',unsafe_allow_html=True)
+                    else: st.info("CASE WHEN explanation requires Phi-3")
+
+                st.markdown("**Risk Analysis**")
+                rx=risk_explain(rd,an)
+                if rx: st.markdown(f'<div class="phi3"><small class="atag">Phi-3 AI Annotation</small><br><br>{rx}</div>',unsafe_allow_html=True)
+                else: st.info("Risk analysis requires Phi-3")
+
+#  MAIN 
 def main():
-    st.markdown(f"""
-    <div class="premium-header">
-        <h1 class="premium-title">🌐 Enterprise Data Explorer 360°</h1>
-        <p class="premium-subtitle">GPU-Accelerated Semantic Matching & Data Lineage</p>
-        <div>
-            <span class="gpu-badge">🚀 Single GPU (8GB) Optimized</span>
-            <span class="gpu-badge">🤖 Phi-3 4-bit Quantized</span>
-            <span class="gpu-badge">⚡ MiniLM Embeddings</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Sidebar
-    with st.sidebar:
-        st.title("📁 Data Upload")
-        
-        st.subheader("1️⃣ Interface Document")
-        interface_file = st.file_uploader("Interface Inventory", type=['xlsx', 'xls'], key='interface')
-        if interface_file:
-            with st.spinner("Loading..."):
-                st.session_state.interface_df = load_excel_file(interface_file)
-                if st.session_state.interface_df is not None:
-                    st.success(f"✅ {len(st.session_state.interface_df)} interfaces")
-        
-        st.subheader("2️⃣ PMIM System (Optional)")
-        pmim_file = st.file_uploader("PMIM Data", type=['xlsx', 'xls'], key='pmim')
-        if pmim_file:
-            st.session_state.pmim_df = load_excel_file(pmim_file, 'PMIMCurrentsystem')
-        
-        st.subheader("3️⃣ PB File Feeds (Optional)")
-        pbfile_file = st.file_uploader("PB Feeds", type=['xlsx', 'xls'], key='pbfile')
-        if pbfile_file:
-            st.session_state.pbfile_df = load_excel_file(pbfile_file, 'PB File Feeds_ORIG')
-        
-        st.subheader("4️⃣ SQL Metadata (Optional)")
-        sql_file = st.file_uploader("SQL Queries", type=['xlsx', 'xls'], key='sql')
-        if sql_file:
-            st.session_state.sql_df = load_excel_file(sql_file)
-        
-        st.markdown("---")
-        st.subheader("🤖 AI Models")
-        
-        if st.button("🔄 Load Models", use_container_width=True):
-            with st.spinner("Loading on GPU..."):
-                st.session_state.embedding_model = load_embedding_model()
-                llm, tok = load_llm_model()
-                st.session_state.llm_model = llm
-                st.session_state.llm_tokenizer = tok
-        
-        if st.session_state.embedding_model:
-            st.info("🟢 Embeddings: Ready")
-        else:
-            st.warning("🔴 Embeddings: Not loaded")
-        
-        if st.session_state.llm_model:
-            st.info("🟢 Phi-3 LLM: Ready (4-bit)")
-        else:
-            st.warning("🔴 Phi-3 LLM: Not loaded")
-        
-        # Memory stats
-        if torch.cuda.is_available():
-            st.caption(f"📊 {gpu_manager.get_memory_stats()}")
-            
-            if st.button("🧹 Clear GPU Memory", use_container_width=True):
-                gpu_manager.clear_memory()
-                st.success("✅ Memory cleared")
-                st.rerun()
-        
-        st.markdown("---")
-        
-        if st.session_state.interface_df is not None and st.session_state.embedding_model:
-            st.subheader("🔗 Semantic Matching")
-            
-            min_conf = st.slider("Min Confidence", 0.3, 0.9, 0.45, 0.05)
-            
-            if st.session_state.sql_df is not None:
-                if st.button("⚡ Run Matching", use_container_width=True):
-                    matcher = SemanticMatcher(st.session_state.embedding_model)
-                    
-                    start = time.time()
-                    st.session_state.mapping_df = generate_interface_sql_mapping(
-                        st.session_state.interface_df,
-                        st.session_state.sql_df,
-                        matcher,
-                        min_conf
-                    )
-                    
-                    if not st.session_state.mapping_df.empty:
-                        st.success(f"✅ {len(st.session_state.mapping_df)} matches in {time.time()-start:.2f}s")
-        
-        st.markdown("---")
-        
-        if st.session_state.interface_df is not None:
-            st.subheader("🔍 Filters")
-            
-            col_name = 'Inbound/Outbound With Respect To Existing Acct Platform'
-            if col_name in st.session_state.interface_df.columns:
-                vals = st.session_state.interface_df[col_name].dropna().unique()
-                st.session_state.filter_flow_direction = st.multiselect(
-                    "Flow Direction",
-                    sorted(vals),
-                    st.session_state.filter_flow_direction
-                )
-            
-            if 'Application' in st.session_state.interface_df.columns:
-                apps = st.session_state.interface_df['Application'].dropna().unique()
-                st.session_state.filter_application = st.multiselect(
-                    "Application",
-                    sorted(apps),
-                    st.session_state.filter_application
-                )
-    
-    # Main content
-    if st.session_state.interface_df is None:
-        st.info("👈 Upload Interface Document to begin")
-    else:
-        df = st.session_state.interface_df.copy()
-        
-        # Apply filters
-        if st.session_state.filter_flow_direction:
-            df = df[df['Inbound/Outbound With Respect To Existing Acct Platform'].isin(st.session_state.filter_flow_direction)]
-        
-        if st.session_state.filter_application:
-            df = df[df['Application'].isin(st.session_state.filter_application)]
-        
-        # Metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Interfaces</div><div class="metric-value">{len(df)}</div></div>', unsafe_allow_html=True)
-        with col2:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Sources</div><div class="metric-value">{df["Source System"].nunique() if "Source System" in df.columns else 0}</div></div>', unsafe_allow_html=True)
-        with col3:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Targets</div><div class="metric-value">{df["Target System"].nunique() if "Target System" in df.columns else 0}</div></div>', unsafe_allow_html=True)
-        with col4:
-            mappings = len(st.session_state.mapping_df) if st.session_state.mapping_df is not None else 0
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Mappings</div><div class="metric-value">{mappings}</div></div>', unsafe_allow_html=True)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Tabs
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🌐 Lineage Graph", "🔗 Mappings", "🤖 AI Insights"])
-        
-        with tab1:
-            st.subheader("📊 Overview Dashboard")
-            
-            col_name = 'Inbound/Outbound With Respect To Existing Acct Platform'
-            if col_name in df.columns:
-                st.markdown("### Flow Direction Distribution")
-                
-                counts = df[col_name].value_counts()
-                colors_list = ['#667eea' if 'inbound' in str(x).lower() else '#f5576c' if 'outbound' in str(x).lower() else '#38ef7d' for x in counts.index]
-                
-                fig = go.Figure(go.Bar(x=counts.index, y=counts.values, marker_color=colors_list, text=counts.values, textposition='auto'))
-                fig.update_layout(title="By Flow Direction", height=400)
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with tab2:
-            st.subheader("🌐 Data Lineage Graph")
-            
-            st.markdown("""
-            <div class="ai-insight" style="background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); border-left-color: #2196f3;">
-                <strong>Legend:</strong><br>
-                <span class="flow-inbound">● Inbound</span> - INTO platform<br>
-                <span class="flow-outbound">● Outbound</span> - OUT OF platform<br>
-                <span class="flow-bidirectional">● Bidirectional</span> - Two-way
-            </div>
-            """, unsafe_allow_html=True)
-            
-            if len(df) > 0:
-                with st.spinner("Creating graph..."):
-                    fig, G = create_data_lineage_graph(df)
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Nodes", G.number_of_nodes())
-                    col2.metric("Edges", G.number_of_edges())
-                    col3.metric("Avg Degree", f"{sum(dict(G.degree()).values()) / G.number_of_nodes():.1f}")
-                    col4.metric("Components", nx.number_weakly_connected_components(G))
-        
-        with tab3:
-            st.subheader("🔗 Interface-SQL Mappings")
-            
-            if st.session_state.mapping_df is not None and not st.session_state.mapping_df.empty:
-                st.success(f"✅ {len(st.session_state.mapping_df)} mappings found")
-                
-                st.dataframe(st.session_state.mapping_df, use_container_width=True, height=400)
-                
-                csv = st.session_state.mapping_df.to_csv(index=False)
-                st.download_button("📥 Download CSV", csv, f"mappings_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
-            else:
-                st.info("Run semantic matching to generate mappings")
-        
-        with tab4:
-            st.subheader("🤖 AI Insights")
-            
-            if st.session_state.llm_model:
-                st.success("✨ Phi-3 Active")
-            
-            options = [f"{row.get('Integration', 'N/A')} - {row.get('Application', 'N/A')}" for _, row in df.iterrows()]
-            
-            if options:
-                selected = st.selectbox("Select Interface", options)
-                selected_idx = df.index[df.apply(lambda r: f"{r.get('Integration', 'N/A')} - {r.get('Application', 'N/A')}" == selected, axis=1)].tolist()[0]
-                selected_row = df.loc[selected_idx]
-                
-                if st.button("🚀 Generate Insights", type="primary"):
-                    with st.spinner("Generating..."):
-                        insights = generate_phi3_insights(
-                            st.session_state.llm_model,
-                            st.session_state.llm_tokenizer,
-                            selected_row
-                        )
-                        
-                        st.markdown(f'<div class="ai-insight">{insights}</div>', unsafe_allow_html=True)
+    st.sidebar.title("Data Explorer 360")
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("Upload Data",expanded=st.session_state.interface_df is None):
+        uf=st.file_uploader("Interface.xlsx",type=["xlsx","xls"],key="iup")
+        if uf:
+            with st.spinner("Loading..."): idf,pmim,feeds=load_ifile(uf)
+            if idf is not None: st.session_state.interface_df=idf; st.session_state.pmim_df=pmim; st.session_state.feeds_df=feeds
+        sf=st.file_uploader("SqlOutput.xls",type=["xlsx","xls"],key="sup")
+        if sf:
+            with st.spinner("Loading..."): st.session_state.sql_df=load_sfile(sf)
 
-if __name__ == "__main__":
-    main()
+    if st.session_state.interface_df is not None and st.session_state.sql_df is not None:
+        st.sidebar.markdown("---"); st.sidebar.subheader("Matching")
+        usem=st.sidebar.checkbox("Semantic (MiniLM)",value=emb_model is not None,disabled=emb_model is None)
+        msc=st.sidebar.slider("Min Score",20,100,40,5)
+        if st.sidebar.button("Generate Mapping",use_container_width=True):
+            with st.spinner("Running 4-step engine..."):
+                st.session_state.mapping_df=gen_mapping(apply_f(st.session_state.interface_df),st.session_state.sql_df,st.session_state.feeds_df,st.session_state.pmim_df,msc,usem)
+                if st.session_state.mapping_df is not None and not st.session_state.mapping_df.empty:
+                    try: st.session_state.mapping_df.to_excel(MAP_FILE,index=False); st.sidebar.success(f"Saved {MAP_FILE}")
+                    except: pass
+            st.rerun()
+
+    if st.session_state.interface_df is not None:
+        st.sidebar.markdown("---"); st.sidebar.subheader("Global Filters")
+        df=st.session_state.interface_df
+        if 'source_system' in df.columns:
+            o=sorted([s for s in df['source_system'].dropna().unique() if s]); st.session_state.f_src=st.sidebar.multiselect("Source System",o,default=st.session_state.f_src)
+        if 'target_system' in df.columns:
+            o=sorted([s for s in df['target_system'].dropna().unique() if s]); st.session_state.f_tgt=st.sidebar.multiselect("Target System",o,default=st.session_state.f_tgt)
+        if 'type' in df.columns:
+            o=sorted([s for s in df['type'].dropna().unique() if s]); st.session_state.f_type=st.sidebar.multiselect("Type",o,default=st.session_state.f_type)
+        if 'application' in df.columns:
+            o=sorted([s for s in df['application'].dropna().unique() if s]); st.session_state.f_app=st.sidebar.multiselect("Application",o,default=st.session_state.f_app)
+        if sum(len(v) for v in [st.session_state.f_src,st.session_state.f_tgt,st.session_state.f_type,st.session_state.f_app])>0:
+            if st.sidebar.button("Clear Filters",use_container_width=True):
+                st.session_state.f_src=[]; st.session_state.f_tgt=[]; st.session_state.f_type=[]; st.session_state.f_app=[]; st.rerun()
+
+    if st.session_state.interface_df is None:
+        st.markdown('<div class="hdr"><h1>Data Explorer 360</h1><p>Bank-Grade Semantic Lineage & SQL Mapping</p></div>',unsafe_allow_html=True)
+        st.info("Upload Interface.xlsx and SqlOutput.xls in the sidebar.")
+        st.markdown("""
+### Spec-Aligned Architecture
+
+| Step | Source | Weight | Purpose |
+|------|--------|--------|---------|
+| **Step 1** Deterministic | Interface sheet ONLY | Major (60 pts) | App, InterfaceName, SourceSystem, Type |
+| **Step 2** Feed Validation | PB_Files_Feeds | Medium (penalty) | Direction consistency, can only DOWNGRADE |
+| **Step 3** Semantic | all-MiniLM-L6-v2 | Minor (25 pts) | Description/SQLText cosine similarity |
+| **Step 4** Aggregation | Combined | Final score | If Step 1 fails -> confidence CANNOT be HIGH |
+
+**Phi-3 LLM (Explanation Only - Never Decisions):**
+- Business intent / Transformation logic / CASE WHEN / Derived columns / Risk
+- 4-bit quantized, max 256 tokens, temp 0.2, local only
+
+**Governance:** All decisions logged. MiniLM scores logged numerically. Phi-3 labeled "AI Annotation".
+        """)
+    else: render_overview()
+
+if __name__=="__main__": main()
